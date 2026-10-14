@@ -1,0 +1,485 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <title>Marli Simons</title>
+  <style>
+    @font-face {
+    font-family: "self-modern_regular";
+    src: url("/self-modern_regular.ttf");
+  }
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: white;
+    }
+    
+    #viewer-container {
+      width: 100vw;
+      height: 100dvh; /* Dynamic viewport height - s'adapte aux barres Safari */
+      overflow-y: scroll;
+      overflow-x: hidden;
+      scroll-behavior: smooth;
+      scrollbar-width: none;
+      -ms-overflow-style: none;
+    }
+    
+    #viewer-container::-webkit-scrollbar {
+      display: none;
+    }
+    
+    #viewer {
+      width: 100%;
+      margin: 0;
+      padding: 0;
+    }
+    
+    .page-container {
+      margin: 0;
+      background: white;
+      width: 100%;
+      min-height: 100vh;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+    }
+
+    .page-wrapper {
+      position: relative;
+    }
+
+    canvas {
+      display: block;
+      width: 100%;
+      height: auto;
+    }
+
+    /* Couche d'annotations : rend les liens du PDF cliquables dans le navigateur */
+    .annotationLayer {
+      position: absolute;
+      top: 0;
+      left: 0;
+      pointer-events: none;
+      transform-origin: 0 0;
+      z-index: 2;
+    }
+
+    .annotationLayer section {
+      position: absolute;
+      text-align: initial;
+      pointer-events: auto;
+      box-sizing: border-box;
+      transform-origin: 0 0;
+    }
+
+    .annotationLayer .linkAnnotation > a {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      font-size: 1em;
+    }
+
+    /* Liens auto-détectés depuis le texte (le PDF n'a pas de vraies annotations de lien) */
+    .linkLayer {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      pointer-events: none;
+      z-index: 3;
+    }
+
+    .linkLayer a {
+      position: absolute;
+      display: block;
+      pointer-events: auto;
+      cursor: pointer;
+      background: transparent;
+    }
+    
+    #loading {
+      position: fixed;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      color: #666;
+      font-size: 18px;
+      font-family: 'self-modern_regular';
+      font-weight: 400;
+      letter-spacing: 0.5px;
+      background: rgba(255, 255, 255, 0.95);
+      padding: 30px 50px;
+      border-radius: 15px;
+      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.1);
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      transition: opacity 0.8s ease-out;
+      z-index: 1000;
+    }
+    
+    #loading.fade-out {
+      opacity: 0;
+    }
+    
+    .dots {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      height: 20px;
+    }
+    
+    .dot {
+      width: 4px;
+      height: 4px;
+      background-color: #666;
+      border-radius: 50%;
+      animation: bounce 1.2s infinite;
+    }
+    
+    .dot:nth-child(1) {
+      animation-delay: 0s;
+    }
+    
+    .dot:nth-child(2) {
+      animation-delay: 0.3s;
+    }
+    
+    .dot:nth-child(3) {
+      animation-delay: 0.6s;
+    }
+    
+    @keyframes bounce {
+      0%, 100% {
+        transform: translateY(0);
+      }
+      25% {
+        transform: translateY(-9px);
+      }
+      50% {
+        transform: translateY(0);
+      }
+    }
+  </style>
+</head>
+<body>
+  <div id="loading">
+    <span>chargement du pdf</span>
+    <div class="dots">
+      <div class="dot"></div>
+      <div class="dot"></div>
+      <div class="dot"></div>
+    </div>
+  </div>
+  
+  <div id="viewer-container">
+    <div id="viewer"></div>
+  </div>
+
+  <!-- Filet de sécurité : script CLASSIQUE (volontairement en JS ancien, sans
+       arrow/const/template) pour s'exécuter même si le module ES échoue sur un
+       navigateur trop vieux. Si le PDF n'est pas chargé après le délai, on
+       ouvre directement le PDF dans le navigateur. -->
+  <script>
+    (function () {
+      var TIMEOUT_MS = 10000;
+      window.__pdfLoaded = false;
+      window.__pdfFallbackTimer = setTimeout(function () {
+        if (window.__pdfLoaded) return;
+        window.location.href = 'src.pdf';
+      }, TIMEOUT_MS);
+    })();
+  </script>
+
+  <script type="module">
+  import * as pdfjsLib from './pdfjs/pdf.mjs';
+
+  pdfjsLib.GlobalWorkerOptions.workerSrc = './pdfjs/pdf.worker.mjs';
+
+  const url = 'src.pdf';
+  let pdfDoc = null;
+  let currentPage = 1;
+  let placeholderRatio = 1.414; /* hauteur/largeur, raffiné dès la 1re page */
+  const pageElements = [];
+  const renderedPages = new Set();
+
+  const loadingDiv = document.getElementById('loading');
+  const viewerContainer = document.getElementById('viewer-container');
+  const viewer = document.getElementById('viewer');
+
+  /* Device pixel ratio for high-resolution rendering */
+  const pixelRatio = window.devicePixelRatio || 1;
+
+  function goToPage(pageNum) {
+    if (!pdfDoc || pageNum < 1 || pageNum > pdfDoc.numPages) return;
+    currentPage = pageNum;
+    pageElements[pageNum - 1].scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+
+  /* Résout une destination interne (lien intra-PDF) vers un numéro de page */
+  async function resolveDestPage(dest) {
+    let explicit = dest;
+    if (typeof dest === 'string') explicit = await pdfDoc.getDestination(dest);
+    if (!Array.isArray(explicit)) return null;
+    const ref = explicit[0];
+    if (ref && typeof ref === 'object') return pdfDoc.getPageIndex(ref);
+    if (typeof ref === 'number') return ref;
+    return null;
+  }
+
+  /* Service de liens minimal : liens externes (nouvel onglet) + liens internes (scroll) */
+  const linkService = {
+    externalLinkEnabled: true,
+    addLinkAttributes(link, href) {
+      link.href = href;
+      link.target = '_blank';
+      link.rel = 'noopener noreferrer nofollow';
+    },
+    getDestinationHash() { return '#'; },
+    getAnchorUrl() { return '#'; },
+    async goToDestination(dest) {
+      try {
+        const idx = await resolveDestPage(dest);
+        if (idx != null) goToPage(idx + 1);
+      } catch (e) { console.error('Lien interne non résolu:', e); }
+    },
+    goToPage(n) { goToPage(n); },
+    executeNamedAction() {},
+    executeSetOCGState() {},
+    isPageVisible() { return true; },
+    isPageCached() { return true; },
+  };
+
+  /* Détection d'URLs/emails dans un fragment de texte */
+  const URL_RE = /^(https?:\/\/\S+|www\.\S+|[^\s@]+@[^\s@]+\.[^\s@]+|[a-z0-9-]+\.(?:com|fr|net|org|io|co|be|ch|eu)(?:\/\S*)?)$/i;
+
+  function toHref(raw) {
+    const s = raw.replace(/[).,;:]+$/, '');
+    if (/^https?:\/\//i.test(s)) return s;
+    if (/^[^\s@]+@[^\s@]+$/.test(s)) return 'mailto:' + s;
+    return 'https://' + s;
+  }
+
+  /* Pose des liens cliquables transparents sur les URLs trouvées dans le texte de la page */
+  async function buildTextLinks(page, cssViewport, scale, wrapper) {
+    const textContent = await page.getTextContent();
+    let layer = null;
+
+    for (const item of textContent.items) {
+      const text = (item.str || '').trim();
+      if (!text || !URL_RE.test(text)) continue;
+
+      const tx = pdfjsLib.Util.transform(cssViewport.transform, item.transform);
+      const fontHeight = Math.hypot(tx[2], tx[3]);
+      const widthPx = item.width * scale;
+      const left = tx[4];
+      const top = tx[5] - fontHeight;
+
+      if (!layer) {
+        layer = document.createElement('div');
+        layer.className = 'linkLayer';
+        wrapper.appendChild(layer);
+      }
+
+      const a = document.createElement('a');
+      a.href = toHref(text);
+      a.target = '_blank';
+      a.rel = 'noopener noreferrer nofollow';
+      a.title = text;
+      a.style.left = `${left}px`;
+      a.style.top = `${top - fontHeight * 0.2}px`;
+      a.style.width = `${widthPx}px`;
+      a.style.height = `${fontHeight * 1.4}px`;
+      layer.appendChild(a);
+    }
+  }
+
+  async function renderPage(pageNumber) {
+    if (renderedPages.has(pageNumber)) return;
+    renderedPages.add(pageNumber); /* réserve tôt pour éviter un double rendu */
+
+    try {
+      const page = await pdfDoc.getPage(pageNumber);
+
+      const QUALITY = 2;          /* sur-échantillonnage : marge de netteté au zoom */
+      const MAX_CANVAS_PX = 4096; /* plafond par dimension (limites mémoire/canvas mobiles) */
+
+      const containerWidth = viewerContainer.clientWidth;
+      const baseViewport = page.getViewport({ scale: 1 });
+      const scale = containerWidth / baseViewport.width; /* échelle d'affichage CSS */
+
+      /* échelle de rastérisation, plafonnée pour ne pas dépasser 4096 px par côté */
+      const maxScale = MAX_CANVAS_PX / Math.max(baseViewport.width, baseViewport.height);
+      const renderScale = Math.min(scale * pixelRatio * QUALITY, maxScale);
+      const renderViewport = page.getViewport({ scale: renderScale });
+      const cssHeight = baseViewport.height * scale;
+
+      const wrapper = document.createElement('div');
+      wrapper.className = 'page-wrapper';
+      wrapper.style.width = `${containerWidth}px`;
+      wrapper.style.height = `${cssHeight}px`;
+
+      const canvas = document.createElement('canvas');
+      const context = canvas.getContext('2d');
+      canvas.width = renderViewport.width;
+      canvas.height = renderViewport.height;
+      canvas.style.width = `${containerWidth}px`;
+      canvas.style.height = `${cssHeight}px`;
+      wrapper.appendChild(canvas);
+
+      await page.render({ canvasContext: context, viewport: renderViewport }).promise;
+
+      const cssViewport = page.getViewport({ scale });
+
+      /* 1) Vraies annotations de lien du PDF (si présentes) */
+      const annotations = await page.getAnnotations({ intent: 'display' });
+      if (annotations.length) {
+        const annotationDiv = document.createElement('div');
+        annotationDiv.className = 'annotationLayer';
+        annotationDiv.style.setProperty('--total-scale-factor', scale);
+        wrapper.appendChild(annotationDiv);
+
+        const annotationLayer = new pdfjsLib.AnnotationLayer({
+          div: annotationDiv, page, viewport: cssViewport, linkService,
+        });
+        await annotationLayer.render({
+          annotations, viewport: cssViewport, linkService, renderForms: false,
+        });
+      }
+
+      /* 2) Liens auto-détectés depuis le texte (ce PDF n'a pas d'annotations) */
+      await buildTextLinks(page, cssViewport, scale, wrapper);
+
+      const pageContainer = pageElements[pageNumber - 1];
+      pageContainer.replaceChildren(wrapper);
+      pageContainer.style.minHeight = 'auto';
+    } catch (error) {
+      renderedPages.delete(pageNumber); /* permet une nouvelle tentative */
+      console.error(`Erreur de rendu page ${pageNumber}:`, error);
+    }
+  }
+
+  /* Rend les pages à l'approche du viewport (2 écrans d'avance) */
+  const observer = new IntersectionObserver((entries) => {
+    for (const entry of entries) {
+      if (entry.isIntersecting) {
+        renderPage(Number(entry.target.dataset.pageNumber));
+      }
+    }
+  }, { root: viewerContainer, rootMargin: '200% 0px' });
+
+  try {
+    /* disableAutoFetch : ne télécharge que les fragments des pages affichées
+       (requêtes HTTP Range) au lieu des 30 Mo d'un coup → premier affichage rapide */
+    pdfDoc = await pdfjsLib.getDocument({
+      url,
+      disableAutoFetch: true,
+      disableStream: false,
+    }).promise;
+
+    /* Ratio de page pour des placeholders de bonne hauteur (scroll stable) */
+    const firstPage = await pdfDoc.getPage(1);
+    const fv = firstPage.getViewport({ scale: 1 });
+    placeholderRatio = fv.height / fv.width;
+    const placeholderHeight = viewerContainer.clientWidth * placeholderRatio;
+
+    for (let pageNumber = 1; pageNumber <= pdfDoc.numPages; pageNumber++) {
+      const pageContainer = document.createElement('div');
+      pageContainer.className = 'page-container';
+      pageContainer.dataset.pageNumber = pageNumber;
+      pageContainer.style.minHeight = `${placeholderHeight}px`;
+      viewer.appendChild(pageContainer);
+      pageElements.push(pageContainer);
+      observer.observe(pageContainer);
+    }
+
+    /* Premier affichage : rendu immédiat de la page 1 */
+    await renderPage(1);
+
+    /* succès : on désamorce le filet de sécurité */
+    window.__pdfLoaded = true;
+    clearTimeout(window.__pdfFallbackTimer);
+
+    loadingDiv.classList.add('fade-out');
+    setTimeout(() => { loadingDiv.style.display = 'none'; }, 800);
+
+  } catch (error) {
+    /* erreur explicite : on désamorce le filet et on ouvre directement le PDF */
+    window.__pdfLoaded = true;
+    clearTimeout(window.__pdfFallbackTimer);
+    console.error('Error:', error);
+    window.location.href = 'src.pdf';
+  }
+
+  /* Keyboard navigation */
+  document.addEventListener('keydown', (e) => {
+    switch(e.key) {
+      case 'ArrowDown':
+      case ' ':
+      case 'PageDown':
+        e.preventDefault();
+        goToPage(currentPage + 1);
+        break;
+      case 'ArrowUp':
+      case 'PageUp':
+        e.preventDefault();
+        goToPage(currentPage - 1);
+        break;
+      case 'Home':
+        e.preventDefault();
+        goToPage(1);
+        break;
+      case 'End':
+        e.preventDefault();
+        if (pdfDoc) goToPage(pdfDoc.numPages);
+        break;
+    }
+  });
+
+  /* Detect currently visible page during scroll */
+  let scrollTimeout;
+  viewerContainer.addEventListener('scroll', () => {
+    clearTimeout(scrollTimeout);
+    scrollTimeout = setTimeout(() => {
+      const containerRect = viewerContainer.getBoundingClientRect();
+      const containerCenter = containerRect.top + containerRect.height / 2;
+
+      for (let i = 0; i < pageElements.length; i++) {
+        const pageRect = pageElements[i].getBoundingClientRect();
+        if (pageRect.top <= containerCenter && pageRect.bottom >= containerCenter) {
+          currentPage = i + 1;
+          break;
+        }
+      }
+    }, 100);
+  });
+
+  /* Re-rendu à la bonne résolution après redimensionnement */
+  let resizeTimeout;
+  window.addEventListener('resize', () => {
+    clearTimeout(resizeTimeout);
+    resizeTimeout = setTimeout(() => {
+      if (!pdfDoc) return;
+      const placeholderHeight = viewerContainer.clientWidth * placeholderRatio;
+      renderedPages.clear();
+      for (const c of pageElements) {
+        c.replaceChildren();
+        c.style.minHeight = `${placeholderHeight}px`;
+      }
+      /* re-rend immédiatement le voisinage visible ; l'observer fait le reste */
+      for (let n = Math.max(1, currentPage - 1); n <= Math.min(pdfDoc.numPages, currentPage + 2); n++) {
+        renderPage(n);
+      }
+    }, 200);
+  });
+</script>
+
+</body>
+</html>
